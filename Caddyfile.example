@@ -1,0 +1,72 @@
+# --- SNIPPET: Reusable CORS Configuration ---
+(cors_config) {
+    @cors_preflight method OPTIONS
+    handle @cors_preflight {
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        header Access-Control-Allow-Headers "Content-Type, Authorization"
+        header Access-Control-Max-Age "3600"
+        respond "" 204
+    }
+    header Access-Control-Allow-Origin "*"
+}
+
+# --- BLOCK 1: Public Access via Tailscale Funnel (Port 8080) ---
+# Tailscale Funnel receives public HTTPS traffic and forwards it here as HTTP.
+# This block handles all routing for the MedAce app.
+:8080 {
+    import cors_config
+
+    route {
+        # 1. Secure Access to Direct Ollama API
+        # To generate a hashed password run: caddy hash-password
+        handle /api/* {
+            basic_auth {
+                YOUR_ADMIN_USERNAME YOUR_CADDY_HASHED_PASSWORD
+            }
+            reverse_proxy 127.0.0.1:11434
+        }
+
+        # 2. Handle document uploads (increase max_size if needed)
+        handle /upload* {
+            request_body {
+                max_size 50MB
+            }
+            reverse_proxy 127.0.0.1:8000
+        }
+
+        # 3. Route MedAce API requests to Python FastAPI
+        handle /ask* {
+            reverse_proxy 127.0.0.1:8000
+        }
+        handle /docs* {
+            reverse_proxy 127.0.0.1:8000
+        }
+        handle /openapi.json* {
+            reverse_proxy 127.0.0.1:8000
+        }
+
+        # 4. Serve the Flutter Website for everything else
+        # Replace with the path to your Flutter web build folder
+        handle {
+            root * YOUR_FLUTTER_WEB_BUILD_PATH
+            file_server
+            try_files {path} /index.html
+        }
+    }
+}
+
+# --- BLOCK 2: Tailscale Private Access (Optional - e.g. Home Assistant) ---
+# Only accessible from within your Tailnet (no Funnel).
+# Replace with your own Tailscale hostname and cert paths.
+# To generate certs run: tailscale cert YOUR_TAILSCALE_HOSTNAME
+YOUR_TAILSCALE_HOSTNAME {
+    tls YOUR_CERT_PATH/YOUR_TAILSCALE_HOSTNAME.crt YOUR_CERT_PATH/YOUR_TAILSCALE_HOSTNAME.key
+
+    handle {
+        reverse_proxy 127.0.0.1:8123
+    }
+}
+
+# Optional: import additional Caddy config files for other projects
+# import YOUR_PATH/other_project.caddy
