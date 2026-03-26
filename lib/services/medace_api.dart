@@ -8,18 +8,18 @@ import 'package:flutter/foundation.dart';
 class MedAceApiService {
   static String get baseUrl {
     if (kReleaseMode) {
-      return 'https://YOUR_TAILSCALE_HOSTNAME';
+      return 'https://omairs-g-14.tail7c5f73.ts.net/';
     }
     if (kIsWeb) {
       return 'http://127.0.0.1:8000';
     }
     if (defaultTargetPlatform == TargetPlatform.android) {
-      return 'https://YOUR_TAILSCALE_HOSTNAME';
+      return 'https://omairs-g-14.tail7c5f73.ts.net/';
     }
     if (defaultTargetPlatform == TargetPlatform.iOS) {
       return 'http://127.0.0.1:8000';
     }
-    return 'https://YOUR_TAILSCALE_HOSTNAME';
+    return 'https://omairs-g-14.tail7c5f73.ts.net/';
   }
 
   static String get askUrl => '$baseUrl/ask';
