@@ -1,45 +1,73 @@
-# Miscellaneous
-*.class
-*.log
+# -----------------------------------------------
+# LOCAL ROUTING & ENVIRONMENT CONFIGS
+# -----------------------------------------------
+# Do not commit files containing personal Tailscale URLs, local paths, or keys
+Caddyfile
+start_medace.bat
+stop_medace.bat
+api.py
+medace_rag.py
+lib/services/medace_api.dart
+searxng_data/
+nul
+
+
+# -----------------------------------------------
+# TLS CERTIFICATES
+# -----------------------------------------------
+*.crt
+*.key
+
+# -----------------------------------------------
+# LOCAL DATABASES & CACHES
+# -----------------------------------------------
+# Keeps your heavy, machine-specific vector store local
+chroma_db/
+
+# -----------------------------------------------
+# PYTHON / FASTAPI
+# -----------------------------------------------
+__pycache__/
 *.pyc
-*.swp
-.DS_Store
-.atom/
-.build/
-.buildlog/
-.history
-.svn/
-.swiftpm/
-migrate_working_dir/
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+dist/
+.pytest_cache/
 
-# IntelliJ related
-*.iml
-*.ipr
-*.iws
-.idea/
-
-# The .vscode folder contains launch configuration and tasks you configure in
-# VS Code which you may wish to be included in version control, so this line
-# is commented out by default.
-#.vscode/
-
-# Flutter/Dart/Pub related
-**/doc/api/
-**/ios/Flutter/.last_build_id
+# -----------------------------------------------
+# FLUTTER / DART
+# -----------------------------------------------
+build/
 .dart_tool/
+.flutter-plugins
 .flutter-plugins-dependencies
+*.g.dart
+.packages
 .pub-cache/
 .pub/
-/build/
 /coverage/
-
-# Symbolication related
 app.*.symbols
-
-# Obfuscation related
 app.*.map.json
 
-# Android Studio will place build artifacts here
+# -----------------------------------------------
+# ANDROID / IOS BUILD ARTIFACTS
+# -----------------------------------------------
 /android/app/debug
 /android/app/profile
 /android/app/release
+**/ios/Flutter/.last_build_id
+
+# -----------------------------------------------
+# IDE & OS SETTINGS
+# -----------------------------------------------
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+Thumbs.db
+desktop.ini

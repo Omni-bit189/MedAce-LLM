@@ -2,6 +2,7 @@ import os
 from typing import Optional
 import uuid
 import tempfile
+import requests
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -12,6 +13,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from ddgs import DDGS
+
 
 app = FastAPI(title="MedAce API")
 
@@ -43,22 +46,33 @@ session_stores: dict[str, dict] = {}
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
-template = """You are MedAce, an AI assistant specializing in medical topics.
-You have access to a medical knowledge base. Use the retrieved context below if it is relevant to the question.
-If the context is not relevant or the question is general, answer using your own knowledge as a helpful AI assistant.
-Never tell the user you are limited to a dataset or cannot answer — just respond helpfully.
+template = """You are MedAce, an expert AI medical assistant. 
+You are equipped with a highly curated knowledge base of peer-reviewed journals, government health authorities, and user-uploaded medical reports.
 
-Context: {context}
+Your goal is to provide accurate, professional, and synthesized answers.
+
+CRITICAL INSTRUCTIONS:
+1. INLINE CITATION: If you pull facts from the context below, you MUST weave the source into your answer. (e.g., "According to the uploaded patient report..." or "Based on guidelines from the CDC...")
+2. NO ROBOTIC PHRASING: Never start your answer with "Based on the provided context" or "According to the context." Speak naturally.
+3. HANDLING GAPS: If the context does not contain the exact answer, rely on your internal medical training to provide a helpful, general response, but add a disclaimer that you are speaking generally.
+4. TONE: Be empathetic, objective, and clinically precise.
+
+Retrieved Context:
+{context}
+
+Chat History: 
+{history}
 
 Question: {question}
 
 Answer:"""
+
 prompt = ChatPromptTemplate.from_template(template)
 
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-def get_combined_docs(question: str, session_id: str = None) -> list:
+def get_combined_docs(question: str, session_id: Optional[str] = None) -> list:
     """Retrieve from permanent DB, and also from session DB if one exists."""
     permanent_docs = permanent_retriever.invoke(question)
 
@@ -68,6 +82,9 @@ def get_combined_docs(question: str, session_id: str = None) -> list:
             search_kwargs={"k": 5}
         )
         session_docs = session_retriever.invoke(question)
+        print(f"Session '{session_id}': retrieved {len(session_docs)} chunks from uploaded docs")
+    elif session_id:
+        print(f"Warning: session_id '{session_id}' not found in session_stores (server may have restarted)")
 
     return permanent_docs + session_docs
 
@@ -76,6 +93,7 @@ class QueryRequest(BaseModel):
     question: str
     model: str = "llama3.2:latest"
     session_id: Optional[str] = None
+    chat_history: list = [] #Chat history
 
 class SessionRequest(BaseModel):
     session_id: str
@@ -86,12 +104,13 @@ async def upload_document(
     file: UploadFile = File(...),
     session_id: str = Form(None)
 ):
-    if not file.filename.endswith(".pdf"):
+    if not file.filename or not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     if not session_id:
         session_id = str(uuid.uuid4())
 
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             contents = await file.read()
@@ -105,11 +124,12 @@ async def upload_document(
         for doc in splits:
             doc.metadata["source"] = file.filename
 
-        os.unlink(tmp_path)
-
         if session_id not in session_stores:
             session_stores[session_id] = {
-                "vectorstore": Chroma(embedding_function=embeddings),
+                "vectorstore": Chroma(
+                    embedding_function=embeddings,
+                    collection_name=f"session_{session_id.replace('-', '_')}"
+                ),
                 "files": []
             }
 
@@ -128,7 +148,7 @@ async def upload_document(
         }
 
     except Exception as e:
-        if os.path.exists(tmp_path):
+        if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         print(f"Upload error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -144,7 +164,113 @@ async def clear_session(request: SessionRequest):
     return {"message": "Session not found — nothing to clear."}
 
 
-# --- 5. Ask Endpoint ---
+# --- 5. Search Endpoint (Powered by Local SearXNG) ---
+@app.post("/search")
+async def search_web(request: QueryRequest):
+    try:
+        print(f"Received search query via SearXNG: {request.question}")
+        
+        # Point to your local SearXNG Docker container
+        searxng_url = "http://YOURLOCALHOSTURLHERE:PORT/search"
+        
+        web_results = []
+        image_results = []
+        context_text = ""
+        
+        # 1. Fetch Text Results for LLM Context
+        # We specify medical/academic engines alongside general ones for better MedAce results
+        text_params = {
+            "q": request.question,
+            "format": "json",
+            "engines": "google,duckduckgo,pubmed", 
+            "language": "en-US"
+        }
+        
+        response = requests.get(searxng_url, params=text_params)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Parse top 5 for the LLM to read
+        for i, item in enumerate(data.get("results", [])[:5]):
+            href = item.get('url', '')
+            domain = item.get('parsed_url', ['', '', ''])[1] if 'parsed_url' in item else href
+            snippet = item.get('content', '')
+            
+            web_results.append({
+                'title': item.get('title', ''),
+                'link': href,
+                'snippet': snippet,
+                'displayLink': domain
+            })
+            # Build context for the LLM
+            context_text += f"[{i+1}] Source: {domain}\nURL: {href}\nContent: {snippet}\n\n"
+
+        # 2. Fetch Image Results for Flutter UI
+        img_params = {
+            "q": request.question,
+            "format": "json",
+            "categories": "images",
+            "engines": "google images,bing images"
+        }
+        try:
+            img_response = requests.get(searxng_url, params=img_params)
+            img_data = img_response.json()
+            
+            for img in img_data.get("results", [])[:4]:
+                image_results.append({
+                    'title': img.get('title', ''),
+                    'image': {
+                        'thumbnailLink': img.get('thumbnail_src', img.get('img_src', '')),
+                        'contextLink': img.get('url', ''),
+                    }
+                })
+        except Exception as img_e:
+            print(f"SearXNG image fetch error (continuing anyway): {img_e}")
+
+        # 3. Summarize with the LLM
+        if not context_text:
+            answer = "I'm sorry, but no web search results were found for your query."
+        else:
+            search_template = """You are MedAce, an AI medical assistant. 
+            Based ONLY on the following web search results, provide a helpful summary to answer the user's question. 
+            Synthesize the information nicely. Cite your sources inline using brackets like [1] or [2].
+            
+            Web Search Results:
+            {context}
+
+            Question: {question}
+
+            Summary:"""
+            
+            search_prompt = ChatPromptTemplate.from_template(search_template)
+            llm = ChatOllama(model=request.model, temperature=0)
+            chain = search_prompt | llm | StrOutputParser()
+            
+            answer = chain.invoke({
+                "context": context_text,
+                "question": request.question
+            })
+        
+        return {
+            "answer": answer,
+            "web_results": web_results,
+            "image_results": image_results,
+            "query": request.question
+        }
+        
+    except requests.exceptions.RequestException as e:
+        print(f"SearXNG connection error: {e}")
+        return {
+            "answer": "Error: Could not connect to the local SearXNG engine. Please ensure your Docker container is running on port 8080.",
+            "web_results": [],
+            "image_results": [],
+            "query": request.question
+        }
+    except Exception as e:
+        print(f"Error during SearXNG search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- 6. Ask Endpoint ---
 @app.post("/ask")
 async def ask_medace(request: QueryRequest):
     try:
@@ -157,11 +283,21 @@ async def ask_medace(request: QueryRequest):
             print(f"Source: {doc.metadata.get('source')} | Page: {doc.metadata.get('page')}")
         print("-------------------------------\n")
 
+        # Format the chat history into a string
+        history_str = ""
+        for msg in request.chat_history:
+            role = "User" if msg.get("role") == "user" else "MedAce"
+            history_str += f"{role}: {msg.get('content')}\n"
+
         llm = ChatOllama(model=request.model, temperature=0)
         context_text = format_docs(combined_docs)
 
         chain = prompt | llm | StrOutputParser()
-        answer = chain.invoke({"context": context_text, "question": request.question})
+        answer = chain.invoke({
+            "context": context_text,
+            "history": history_str,
+            "question": request.question
+        })
 
         sources = []
         for doc in combined_docs:
