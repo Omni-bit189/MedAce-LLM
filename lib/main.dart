@@ -1,10 +1,15 @@
 import 'package:flutter/material.dart';
+import 'dart:convert';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'services/medace_api.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+// --- Theme Notifier ---
+final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.light);
+
 void main() {
-  runApp(MyApp());
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
@@ -12,11 +17,34 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'MedAce Chat App',
-      theme: ThemeData(primarySwatch: Colors.blue),
-      home: OllamaChatPage(),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeNotifier,
+      builder: (_, ThemeMode currentMode, _) {
+        return MaterialApp(
+          debugShowCheckedModeBanner: false,
+          title: 'MedAce Chat App',
+          theme: ThemeData(
+            primarySwatch: Colors.blue,
+            brightness: Brightness.light,
+            scaffoldBackgroundColor: Colors.white,
+            appBarTheme: const AppBarTheme(
+              backgroundColor: Colors.blue,
+              foregroundColor: Colors.white,
+            ),
+          ),
+          darkTheme: ThemeData(
+            primarySwatch: Colors.blue,
+            brightness: Brightness.dark,
+            scaffoldBackgroundColor: const Color(0xFF121212),
+            appBarTheme: AppBarTheme(
+              backgroundColor: Colors.grey[900],
+              foregroundColor: Colors.white,
+            ),
+          ),
+          themeMode: currentMode,
+          home: const OllamaChatPage(),
+        );
+      },
     );
   }
 }
@@ -30,41 +58,105 @@ class OllamaChatPage extends StatefulWidget {
 
 class _OllamaChatPageState extends State<OllamaChatPage> {
   final _controller = TextEditingController();
-  final List<ChatMessage> _messages = [];
+  
+  // State variables
   bool _isLoading = false;
   bool _isUploading = false;
-
-  // Session management
-  String? _sessionId;
-  List<String> _uploadedFiles = [];
-
+  String _selectedModel = 'llama3.2:latest';
   final List<String> _availableModels = [
     'llama3.2:latest',
     'medllama2:7b-q4_K_M',
     'AntAngelMed/MedGemma1.5:4b',
   ];
-  // ignore: prefer_final_fields
-  String _selectedModel = 'llama3.2:latest'; // Default model
 
-// --- Clear chat history ---
-  void _clearChat() {
+  // Chat History Management
+  List<ChatSession> _allSessions = [];
+  late ChatSession _currentSession;
+  final String _storageKey = 'medace_chat_history';
+
+  @override
+  void initState() {
+    super.initState();
+    _createNewSession(); 
+    _loadSavedSessions(); 
+  }
+
+  // --- LOCAL STORAGE LOGIC ---
+  Future<void> _loadSavedSessions() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String? savedData = prefs.getString(_storageKey);
+    
+    if (savedData != null) {
+      final List<dynamic> decoded = jsonDecode(savedData);
+      setState(() {
+        _allSessions = decoded.map((e) => ChatSession.fromJson(e)).toList();
+      });
+    }
+  }
+
+  Future<void> _saveSessionsToDisk() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String encoded = jsonEncode(_allSessions.map((e) => e.toJson()).toList());
+    await prefs.setString(_storageKey, encoded);
+  }
+
+  // --- SESSION MANAGEMENT LOGIC ---
+  void _createNewSession() {
     setState(() {
-      _messages.clear();
-      _messages.add(
+      _currentSession = ChatSession(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        title: 'New Chat',
+        messages: [],
+      );
+    });
+  }
+
+  void _loadSession(String id) {
+    setState(() {
+      _currentSession = _allSessions.firstWhere((session) => session.id == id);
+    });
+    Navigator.pop(context); // Close the drawer
+  }
+
+  void _deleteSession(String id) {
+    setState(() {
+      _allSessions.removeWhere((session) => session.id == id);
+      if (_currentSession.id == id) {
+        _createNewSession();
+      }
+      _saveSessionsToDisk();
+    });
+  }
+
+  void _updateCurrentSessionData() {
+    if (!_allSessions.any((s) => s.id == _currentSession.id) && _currentSession.messages.isNotEmpty) {
+      final firstMsg = _currentSession.messages.firstWhere((m) => m.isUser).text;
+      _currentSession.title = firstMsg.length > 20 ? '${firstMsg.substring(0, 20)}...' : firstMsg;
+      _allSessions.insert(0, _currentSession); 
+    }
+    _saveSessionsToDisk();
+  }
+
+  // --- CHAT LOGIC ---
+  void _clearCurrentChat() {
+    setState(() {
+      _currentSession.messages.clear();
+      _currentSession.messages.add(
         ChatMessage(
-          text: '🧹 Chat history cleared. Starting fresh!',
+          text: '🧹 Chat history cleared for this session. Starting fresh!',
           isUser: false,
           isSystem: true,
         ),
       );
+      _updateCurrentSessionData();
     });
   }
-  // --- Upload a PDF ---
+
   Future<void> _uploadDocument() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['pdf'],
-      withData: true, // needed for web support
+      withData: true,
     );
 
     if (result == null || result.files.isEmpty) return;
@@ -74,49 +166,34 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
 
     try {
       Map<String, dynamic>? response;
-
       if (file.bytes != null) {
-        // Web or mobile with bytes
         response = await MedAceApiService.uploadDocumentBytes(
           file.bytes!,
           file.name,
-          sessionId: _sessionId,
+          sessionId: _currentSession.backendSessionId,
         );
       } else if (file.path != null) {
-        // Mobile/desktop with file path
         response = await MedAceApiService.uploadDocument(
           file.path!,
           file.name,
-          sessionId: _sessionId,
+          sessionId: _currentSession.backendSessionId,
         );
       }
 
       if (response != null) {
+        final data = response;
         setState(() {
-          _sessionId = response!['session_id'];
-          _uploadedFiles = List<String>.from(response['files_in_session']);
-        });
-
-        // Show confirmation in chat
-        setState(() {
-          _messages.add(
+          _currentSession.backendSessionId = data['session_id'];
+          // BUG FIX APPLIED HERE:
+          _currentSession.uploadedFiles = List<String>.from(data['files_in_session'] ?? [file.name]);
+          _currentSession.messages.add(
             ChatMessage(
-              text:
-                  '📄 "${file.name}" uploaded successfully. You can now ask questions about it.',
+              text: '📄 "${file.name}" uploaded successfully. You can now ask questions about it.',
               isUser: false,
               isSystem: true,
             ),
           );
-        });
-      } else {
-        setState(() {
-          _messages.add(
-            ChatMessage(
-              text: 'Failed to upload "${file.name}". Please try again.',
-              isUser: false,
-              isSystem: true,
-            ),
-          );
+          _updateCurrentSessionData();
         });
       }
     } finally {
@@ -124,67 +201,50 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
     }
   }
 
-  //Clear documents for a session
   Future<void> _clearDocuments() async {
-    if (_sessionId == null) return;
-
-    final success = await MedAceApiService.clearSession(_sessionId!);
-
+    if (_currentSession.backendSessionId == null) return;
+    await MedAceApiService.clearSession(_currentSession.backendSessionId!);
     setState(() {
-      // Always clear the local state regardless of server response
-      // If server already cleared it or session expired, we still want UI to reset
-      _sessionId = null;
-      _uploadedFiles = [];
-      _messages.add(
-        ChatMessage(
-          text: 'All uploaded documents have been removed.',
-          isUser: false,
-          isSystem: true,
-        ),
-      );
+      _currentSession.backendSessionId = null;
+      _currentSession.uploadedFiles = [];
+      _currentSession.messages.add(ChatMessage(text: 'All uploaded documents have been removed from this session.', isUser: false, isSystem: true));
+      _updateCurrentSessionData();
     });
-
-    if (!success) {
-      // ignore: avoid_print
-      print("Server clear failed but local state was reset.");
-    }
   }
 
-  // --- Send a message ---
   Future<void> _sendMessage(String text) async {
     if (text.trim().isEmpty) return;
 
     List<Map<String, String>> history = [];
-    int historyLimit = 10;
-    int start = _messages.length > historyLimit ? _messages.length - historyLimit : 0;
+    int start = _currentSession.messages.length > 10 ? _currentSession.messages.length - 10 : 0;
 
-    for (int i = start; i < _messages.length; i++) {
-      // Ignore system messages and search results to save tokens
-      if (!_messages[i].isSystem && _messages[i].searchResults == null) {
+    for (int i = start; i < _currentSession.messages.length; i++) {
+      if (!_currentSession.messages[i].isSystem && _currentSession.messages[i].searchResults == null) {
         history.add({
-          'role': _messages[i].isUser ? 'user' : 'assistant',
-          'content': _messages[i].text,
+          'role': _currentSession.messages[i].isUser ? 'user' : 'assistant',
+          'content': _currentSession.messages[i].text,
         });
       }
     }
 
     _controller.clear();
     setState(() {
-      _messages.add(ChatMessage(text: text, isUser: true));
+      _currentSession.messages.add(ChatMessage(text: text, isUser: true));
       _isLoading = true;
+      _updateCurrentSessionData();
     });
 
     final responseData = await MedAceApiService.askQuestion(
       text,
       _selectedModel,
-      sessionId: _sessionId,
+      sessionId: _currentSession.backendSessionId,
       chatHistory: history,
     );
 
     setState(() {
       _isLoading = false;
       if (responseData != null) {
-        _messages.add(
+        _currentSession.messages.add(
           ChatMessage(
             text: responseData['answer'],
             isUser: false,
@@ -192,31 +252,20 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
           ),
         );
       } else {
-        _messages.add(
-          ChatMessage(
-            text:
-                'Error: Failed to connect to the MedAce Python API. Check your server IP.',
-            isUser: false,
-          ),
-        );
+        _currentSession.messages.add(ChatMessage(text: 'Error: Failed to connect to the MedAce Python API.', isUser: false));
       }
+      _updateCurrentSessionData();
     });
   }
 
-  // --- Search the web ---
   Future<void> _searchWeb(String text) async {
     if (text.trim().isEmpty) return;
-
     _controller.clear();
+    
     setState(() {
-      _messages.add(
-        ChatMessage(
-          text: '🔍 Searching for: "$text"',
-          isUser: false,
-          isSystem: true,
-        ),
-      );
+      _currentSession.messages.add(ChatMessage(text: '🔍 Searching for: "$text"', isUser: false, isSystem: true));
       _isLoading = true;
+      _updateCurrentSessionData();
     });
 
     final responseData = await MedAceApiService.searchWeb(text, _selectedModel);
@@ -224,218 +273,244 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
     setState(() {
       _isLoading = false;
       if (responseData != null) {
-        // Add a message with search results
-        _messages.add(
+        _currentSession.messages.add(
           ChatMessage(
             text: responseData['answer'] ?? 'Here are your results:',
             isUser: false,
-            isSystem: false, // must be false — ChatBubble hides results when isSystem=true
-            searchResults: (responseData['web_results'] as List)
-                .map(
-                  (result) => {
-                    'title': result['title'] ?? '',
-                    'snippet': result['snippet'] ?? '',
-                    'displayLink': result['displayLink'] ?? '',
-                    'link': result['link'] ?? '', // NEW: Grab the actual URL,
+            searchResults: (responseData['web_results'] as List?)?.map((result) => {
+                  'title': result['title'] ?? '',
+                  'snippet': result['snippet'] ?? '',
+                  'displayLink': result['displayLink'] ?? '',
+                  'link': result['link'] ?? '',
+                }).toList(),
+            // BUG FIX APPLIED HERE:
+            imageResults: (responseData['image_results'] as List?)?.where((result) => result['image'] != null).map((result) => {
+                  'title': result['title'] ?? '',
+                  'image': {
+                    'thumbnailLink': result['image']?['thumbnailLink'] ?? '',
+                    'contextLink': result['image']?['contextLink'] ?? '',
                   },
-                )
-                .toList(),
-            imageResults: (responseData['image_results'] as List)
-                .where((result) => result['image'] != null)
-                .map(
-                  (result) => {
-                    'title': result['title'] ?? '',
-                    'image': {
-                      'thumbnailLink': result['image']['thumbnailLink'] ?? '',
-                      'contextLink': result['image']['contextLink'] ?? '',
-                      'height': result['image']['height'] ?? 0,
-                      'width': result['image']['width'] ?? 0,
-                      'byteSize': result['image']['byteSize'] ?? 0,
-                    },
-                  },
-                )
-                .toList(),
+                }).toList(),
           ),
         );
       } else {
-        _messages.add(
-          ChatMessage(
-            text:
-                'Error: Failed to perform web search. Check your API configuration.',
-            isUser: false,
-            isSystem: true,
-          ),
-        );
+        _currentSession.messages.add(ChatMessage(text: 'Error: Failed to perform web search.', isUser: false, isSystem: true));
       }
+      _updateCurrentSessionData();
     });
   }
 
   @override
   Widget build(BuildContext context) {
-  return Scaffold(
-    appBar: AppBar(
-      title: Text('MedAce Chat App'),
-      
-      actions: [
-        IconButton(
-          icon: const Icon(Icons.delete_sweep),
-          tooltip: 'Clear Chat',
-          onPressed: _clearChat,
-        ),
-        // Model selector
-        Container(
-          decoration: BoxDecoration(
-            color: Colors.blue,
-            borderRadius: BorderRadius.horizontal(
-              left: Radius.zero,
-              right: Radius.zero,
+    return Scaffold(
+      drawer: Drawer(
+        child: Column(
+          children: [
+            UserAccountsDrawerHeader(
+              accountName: const Text("MedAce History", style: TextStyle(fontWeight: FontWeight.bold)),
+              accountEmail: Text("${_allSessions.length} saved chats"),
+              currentAccountPicture: const CircleAvatar(
+                backgroundColor: Colors.white,
+                child: Icon(Icons.medical_services, color: Colors.blue, size: 30),
+              ),
+              decoration: BoxDecoration(color: Theme.of(context).appBarTheme.backgroundColor),
             ),
+            ListTile(
+              leading: const Icon(Icons.add_circle_outline),
+              title: const Text('New Chat'),
+              onTap: () {
+                Navigator.pop(context);
+                _createNewSession();
+              },
+            ),
+            const Divider(),
+            Expanded(
+              child: ListView.builder(
+                itemCount: _allSessions.length,
+                itemBuilder: (context, index) {
+                  final session = _allSessions[index];
+                  final isSelected = session.id == _currentSession.id;
+                  return ListTile(
+                    selected: isSelected,
+                    selectedTileColor: Theme.of(context).primaryColor.withOpacity(0.1),
+                    leading: const Icon(Icons.chat_bubble_outline),
+                    title: Text(session.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.delete_outline, size: 20),
+                      color: Colors.redAccent,
+                      onPressed: () => _deleteSession(session.id),
+                    ),
+                    onTap: () => _loadSession(session.id),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+      appBar: AppBar(
+        title: const Text('MedAce'),
+        actions: [
+          IconButton(
+            icon: Icon(themeNotifier.value == ThemeMode.light ? Icons.dark_mode : Icons.light_mode),
+            tooltip: 'Toggle Theme',
+            onPressed: () {
+              themeNotifier.value = themeNotifier.value == ThemeMode.light ? ThemeMode.dark : ThemeMode.light;
+            },
           ),
-          child: Padding(
+          IconButton(
+            icon: const Icon(Icons.delete_sweep),
+            tooltip: 'Clear Current Chat',
+            onPressed: _clearCurrentChat,
+          ),
+          Container(
+            color: Theme.of(context).appBarTheme.backgroundColor,
             padding: const EdgeInsets.symmetric(horizontal: 16.0),
             child: DropdownButton<String>(
               value: _selectedModel,
-              icon: const Icon(Icons.arrow_drop_down, color: Colors.blue),
-              dropdownColor: Colors.blue[700],
+              icon: const Icon(Icons.arrow_drop_down, color: Colors.white),
+              dropdownColor: Theme.of(context).appBarTheme.backgroundColor,
               style: const TextStyle(color: Colors.white, fontSize: 14),
               underline: Container(height: 0),
-              onChanged: (String? newValue) {
-                setState(() => _selectedModel = newValue!);
-              },
-              items: _availableModels.map<DropdownMenuItem<String>>((
-                String model,
-              ) {
-                return DropdownMenuItem<String>(
-                  value: model,
-                  child: Text(model.split(':')[0]),
-                );
+              onChanged: (String? newValue) => setState(() => _selectedModel = newValue!),
+              items: _availableModels.map<DropdownMenuItem<String>>((String model) {
+                return DropdownMenuItem<String>(value: model, child: Text(model.split(':')[0]));
               }).toList(),
             ),
           ),
-        ),
-      ],
-    ),
-    body: Column(
-      children: [
-        // --- Uploaded files banner ---
-        if (_uploadedFiles.isNotEmpty)
-          Container(
-            width: double.infinity,
-            color: Colors.blue[50],
-            padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        ],
+      ),
+      body: Column(
+        children: [
+          if (_currentSession.uploadedFiles.isNotEmpty)
+            Container(
+              width: double.infinity,
+              color: Theme.of(context).brightness == Brightness.dark ? Colors.blue[900]?.withOpacity(0.3) : Colors.blue[50],
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                children: [
+                  Icon(Icons.description, size: 16, color: Colors.blue[700]),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text('Docs: ${_currentSession.uploadedFiles.join(', ')}', style: TextStyle(fontSize: 12, color: Colors.blue[700]), overflow: TextOverflow.ellipsis),
+                  ),
+                  GestureDetector(onTap: _clearDocuments, child: Icon(Icons.close, size: 16, color: Colors.blue[700])),
+                ],
+              ),
+            ),
+
+          Expanded(
+            child: ListView.builder(
+              padding: const EdgeInsets.all(8.0),
+              itemCount: _currentSession.messages.length,
+              itemBuilder: (context, index) {
+                return ChatBubble(message: _currentSession.messages[index]);
+              },
+            ),
+          ),
+
+          if (_isLoading) const LinearProgressIndicator(),
+          if (_isUploading)
+            const Padding(
+              padding: EdgeInsets.all(8.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                  SizedBox(width: 8),
+                  Text('Uploading document...', style: TextStyle(fontSize: 12)),
+                ],
+              ),
+            ),
+
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8.0),
             child: Row(
               children: [
-                Icon(Icons.description, size: 16, color: Colors.blue[700]),
-                SizedBox(width: 8),
+                IconButton(icon: const Icon(Icons.attach_file), tooltip: 'Upload PDF', onPressed: _isUploading ? null : _uploadDocument),
+                IconButton(icon: const Icon(Icons.travel_explore), tooltip: 'Search Web', onPressed: _isUploading ? null : () => _searchWeb(_controller.text)),
                 Expanded(
-                  child: Text(
-                    'Docs: ${_uploadedFiles.join(', ')}',
-                    style: TextStyle(fontSize: 12, color: Colors.blue[700]),
-                    overflow: TextOverflow.ellipsis,
+                  child: TextField(
+                    controller: _controller,
+                    onSubmitted: _sendMessage,
+                    decoration: InputDecoration(
+                      hintText: 'Ask MedAce...',
+                      filled: true,
+                      fillColor: Theme.of(context).brightness == Brightness.dark ? Colors.grey[800] : Colors.grey[200],
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(20), borderSide: BorderSide.none),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    ),
                   ),
                 ),
-                GestureDetector(
-                  onTap: _clearDocuments,
-                  child: Icon(Icons.close, size: 16, color: Colors.blue[700]),
+                IconButton(
+                  icon: const Icon(Icons.send, color: Colors.blue),
+                  onPressed: () => _sendMessage(_controller.text),
                 ),
               ],
             ),
           ),
-
-        // --- Chat messages ---
-        Expanded(
-          child: ListView.builder(
-            padding: EdgeInsets.all(8.0),
-            itemCount: _messages.length,
-            itemBuilder: (context, index) {
-              return ChatBubble(message: _messages[index]);
-            },
-          ),
-        ),
-
-        if (_isLoading) LinearProgressIndicator(),
-        if (_isUploading)
-          Padding(
-            padding: EdgeInsets.all(8.0),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-                SizedBox(width: 8),
-                Text(
-                  'Uploading and processing document...',
-                  style: TextStyle(fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-
-        // --- Input row ---
-        Padding(
-          padding: EdgeInsets.symmetric(horizontal: 8.0),
-          child: Row(
-            children: [
-              // Upload button
-              IconButton(
-                icon: Icon(Icons.attach_file),
-                tooltip: 'Upload PDF',
-                onPressed: _isUploading ? null : _uploadDocument,
-              ),
-              // Search button
-              IconButton(
-                icon: Icon(Icons.search),
-                tooltip: 'Search Web',
-                onPressed: _isUploading
-                    ? null
-                    : () => _searchWeb(_controller.text),
-              ),
-              // Text input
-              Expanded(
-                child: TextField(
-                  controller: _controller,
-                  onSubmitted: _sendMessage,
-                  decoration: InputDecoration(hintText: 'Enter your message'),
-                ),
-              ),
-              // Send button
-              IconButton(
-                icon: Icon(Icons.send),
-                onPressed: () => _sendMessage(_controller.text),
-              ),
-            ],
-          ),
-        ),
-        SizedBox(height: 10),
-      ],
-    ),
-  );
+          const SizedBox(height: 10),
+        ],
+      ),
+    );
+  }
 }
-} // end _OllamaChatPageState
 
-// --- Chat Message Model ---
+class ChatSession {
+  final String id;
+  String title;
+  List<ChatMessage> messages;
+  String? backendSessionId;
+  List<String> uploadedFiles;
+
+  ChatSession({required this.id, required this.title, required this.messages, this.backendSessionId, this.uploadedFiles = const []});
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'backendSessionId': backendSessionId,
+        'uploadedFiles': uploadedFiles,
+        'messages': messages.map((m) => m.toJson()).toList(),
+      };
+
+  factory ChatSession.fromJson(Map<String, dynamic> json) => ChatSession(
+        id: json['id'],
+        title: json['title'],
+        backendSessionId: json['backendSessionId'],
+        uploadedFiles: List<String>.from(json['uploadedFiles'] ?? []),
+        messages: (json['messages'] as List).map((m) => ChatMessage.fromJson(m)).toList(),
+      );
+}
+
 class ChatMessage {
   final String text;
   final bool isUser;
-  final List<dynamic>? sources;
   final bool isSystem;
-  final List<dynamic>? searchResults; // New field for search results
-  final List<dynamic>? imageResults; // New field for image results
+  final List<dynamic>? sources;
+  final List<dynamic>? searchResults;
+  final List<dynamic>? imageResults;
 
-  ChatMessage({
-    required this.text,
-    required this.isUser,
-    this.sources,
-    this.isSystem = false,
-    this.searchResults,
-    this.imageResults,
-  });
+  ChatMessage({required this.text, required this.isUser, this.isSystem = false, this.sources, this.searchResults, this.imageResults});
+
+  Map<String, dynamic> toJson() => {
+        'text': text,
+        'isUser': isUser,
+        'isSystem': isSystem,
+        'sources': sources,
+        'searchResults': searchResults,
+        'imageResults': imageResults,
+      };
+
+  factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
+        text: json['text'] ?? '',
+        isUser: json['isUser'] ?? false,
+        isSystem: json['isSystem'] ?? false,
+        sources: json['sources'] as List<dynamic>?,
+        searchResults: json['searchResults'] as List<dynamic>?,
+        imageResults: json['imageResults'] as List<dynamic>?,
+      );
 }
 
-// --- Chat Bubble Widget ---
 class ChatBubble extends StatelessWidget {
   final ChatMessage message;
 
@@ -443,183 +518,76 @@ class ChatBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final alignment = message.isUser
-        ? CrossAxisAlignment.end
-        : CrossAxisAlignment.start;
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
+    final alignment = message.isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start;
+    
     Color bgColor;
+    Color textColor = isDark ? Colors.white : Colors.black;
     if (message.isSystem) {
-      bgColor = Colors.green[50]!;
+      bgColor = isDark ? Colors.green[900]!.withOpacity(0.5) : Colors.green[50]!;
     } else if (message.isUser) {
-      bgColor = Colors.blue[100]!;
+      bgColor = isDark ? Colors.blue[800]! : Colors.blue[100]!;
     } else {
-      bgColor = Colors.grey[200]!;
+      bgColor = isDark ? Colors.grey[800]! : Colors.grey[200]!;
     }
 
     return Column(
       crossAxisAlignment: alignment,
       children: [
         Container(
-          margin: EdgeInsets.symmetric(vertical: 4.0),
-          padding: EdgeInsets.all(12.0),
-          decoration: BoxDecoration(
-            color: bgColor,
-            borderRadius: BorderRadius.circular(8.0),
-          ),
+          margin: const EdgeInsets.symmetric(vertical: 4.0),
+          padding: const EdgeInsets.all(12.0),
+          decoration: BoxDecoration(color: bgColor, borderRadius: BorderRadius.circular(12.0)),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
                 message.text.trim(),
-                style: TextStyle(
-                  color: Colors.black,
-                  fontStyle: message.isSystem
-                      ? FontStyle.italic
-                      : FontStyle.normal,
-                ),
+                style: TextStyle(color: textColor, fontStyle: message.isSystem ? FontStyle.italic : FontStyle.normal),
               ),
-              // Display search results if available
-              if (!message.isUser &&
-                  !message.isSystem &&
-                  message.searchResults != null &&
-                  message.searchResults!.isNotEmpty) ...[
-                Divider(color: Colors.grey[400], thickness: 1, height: 20),
-                Text(
-                  "Web Search Results:",
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 12,
-                    color: Colors.grey[800],
-                  ),
-                ),
-                ...message.searchResults!
-                    .map(
-                      (result) => InkWell(
-                        // NEW: Make the source clickable!
-                        onTap: () async {
-                          final urlString = result['link'];
-                          if (urlString != null && urlString.isNotEmpty) {
-                            final url = Uri.parse(urlString);
-                            if (await canLaunchUrl(url)) {
-                              await launchUrl(url, mode: LaunchMode.externalApplication);
-                            }
-                          }
-                        },
-                        child: Padding(
-                          padding: const EdgeInsets.only(bottom: 12.0),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                "[Source] ${result['title']}",
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.blue[800], // Make it look like a link
-                                  fontWeight: FontWeight.bold,
-                                  decoration: TextDecoration.underline,
-                                ),
-                              ),
-                              SizedBox(height: 2),
-                              Text(
-                                "${result['snippet']}",
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: Colors.grey[800],
-                                ),
-                              ),
-                              Text(
-                                "${result['displayLink']}",
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  color: Colors.grey[500],
-                                ),
-                              ),
-                            ],
-                          ),
+              if (!message.isUser && !message.isSystem && message.searchResults != null && message.searchResults!.isNotEmpty) ...[
+                Divider(color: Colors.grey[500], thickness: 1, height: 20),
+                Text("Web Search Results:", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: textColor)),
+                ...message.searchResults!.map((result) => InkWell(
+                      onTap: () async {
+                        final urlString = result['link'];
+                        if (urlString != null && urlString.isNotEmpty) {
+                          final url = Uri.parse(urlString);
+                          if (await canLaunchUrl(url)) await launchUrl(url, mode: LaunchMode.externalApplication);
+                        }
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 12.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text("[Source] ${result['title']}", style: TextStyle(fontSize: 12, color: isDark ? Colors.blue[300] : Colors.blue[800], fontWeight: FontWeight.bold, decoration: TextDecoration.underline)),
+                            const SizedBox(height: 2),
+                            Text("${result['snippet']}", style: TextStyle(fontSize: 11, color: isDark ? Colors.grey[300] : Colors.grey[800])),
+                            Text("${result['displayLink']}", style: TextStyle(fontSize: 10, color: Colors.grey[500])),
+                          ],
                         ),
                       ),
-                    ),
-                    
+                    )),
               ],
-              // Display image results if available
-              if (!message.isUser &&
-                  !message.isSystem &&
-                  message.imageResults != null &&
-                  message.imageResults!.isNotEmpty) ...[
-                Divider(color: Colors.grey[400], thickness: 1, height: 20),
-                Text(
-                  "Image Search Results:",
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 12,
-                    color: Colors.grey[800],
-                  ),
-                ),
+              if (!message.isUser && !message.isSystem && message.imageResults != null && message.imageResults!.isNotEmpty) ...[
+                Divider(color: Colors.grey[500], thickness: 1, height: 20),
+                Text("Image Search Results:", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: textColor)),
                 Wrap(
-                  spacing: 8.0,
-                  runSpacing: 8.0,
-                  children: message.imageResults!
-                      .map(
-                        (result) => Container(
-                          width: 100,
-                          height: 100,
-                          decoration: BoxDecoration(
-                            border: Border.all(color: Colors.grey[300]!),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child:
-                              result['image'] != null &&
-                                  result['image']['thumbnailLink'] != null
-                              ? Image.network(
-                                  result['image']['thumbnailLink'],
-                                  fit: BoxFit.cover,
-                                  errorBuilder: (context, error, stackTrace) =>
-                                      Container(
-                                        color: Colors.grey[200],
-                                        child: Icon(
-                                          Icons.broken_image,
-                                          size: 20,
-                                          color: Colors.grey[400],
-                                        ),
-                                      ),
-                                )
-                              : Container(
-                                  color: Colors.grey[200],
-                                  child: Icon(
-                                    Icons.image,
-                                    size: 30,
-                                    color: Colors.grey[400],
-                                  ),
-                                ),
-                        ),
-                      )
-                      .toList(),
+                  spacing: 8.0, runSpacing: 8.0,
+                  children: message.imageResults!.map((result) => Container(
+                          width: 100, height: 100,
+                          decoration: BoxDecoration(border: Border.all(color: Colors.grey[500]!), borderRadius: BorderRadius.circular(4)),
+                          child: result['image'] != null && result['image']['thumbnailLink'] != null
+                              ? Image.network(result['image']['thumbnailLink'], fit: BoxFit.cover, errorBuilder: (c, e, s) => Container(color: Colors.grey[200], child: const Icon(Icons.broken_image)))
+                              : Container(color: Colors.grey[200], child: const Icon(Icons.image)),
+                        )).toList(),
                 ),
               ],
-              // Display sources if available (existing functionality)
-              if (!message.isUser &&
-                  !message.isSystem &&
-                  message.sources != null &&
-                  message.sources!.isNotEmpty) ...[
-                Divider(color: Colors.grey[400], thickness: 1, height: 20),
-                Text(
-                  "Sources:",
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 12,
-                    color: Colors.grey[800],
-                  ),
-                ),
-                ...message.sources!
-                    .map(
-                      (source) => Text(
-                        "- ${source['file']} (Page ${source['page']})",
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: Colors.grey[700],
-                          fontStyle: FontStyle.italic,
-                        ),
-                      ),
-                    ),
+              if (!message.isUser && !message.isSystem && message.sources != null && message.sources!.isNotEmpty) ...[
+                Divider(color: Colors.grey[500], thickness: 1, height: 20),
+                Text("Sources:", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: textColor)),
+                ...message.sources!.map((source) => Text("- ${source['file']} (Page ${source['page']})", style: TextStyle(fontSize: 11, color: isDark ? Colors.grey[400] : Colors.grey[700], fontStyle: FontStyle.italic))),
               ],
             ],
           ),

@@ -39,6 +39,12 @@
         handle /ask* {
             reverse_proxy 127.0.0.1:8000
         }
+	handle /search* {
+            reverse_proxy 127.0.0.1:8000
+        }
+        handle /clear-session* {
+            reverse_proxy 127.0.0.1:8000
+        }
         handle /docs* {
             reverse_proxy 127.0.0.1:8000
         }
