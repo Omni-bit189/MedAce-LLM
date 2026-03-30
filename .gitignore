@@ -9,8 +9,7 @@ api.py
 medace_rag.py
 lib/services/medace_api.dart
 searxng_data/
-nul
-
+.env
 
 # -----------------------------------------------
 # TLS CERTIFICATES
@@ -71,3 +70,4 @@ app.*.map.json
 .DS_Store
 Thumbs.db
 desktop.ini
+nul
