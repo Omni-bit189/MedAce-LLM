@@ -239,8 +239,7 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
         : 0;
 
     for (int i = start; i < _currentSession.messages.length; i++) {
-      if (!_currentSession.messages[i].isSystem &&
-          _currentSession.messages[i].searchResults == null) {
+      if (!_currentSession.messages[i].isSystem) {
         history.add({
           'role': _currentSession.messages[i].isUser ? 'user' : 'assistant',
           'content': _currentSession.messages[i].text,
@@ -289,13 +288,18 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
     _controller.clear();
 
     setState(() {
+      // FIX: Record the actual question as a standard User message so it enters the history
+      _currentSession.messages.add(ChatMessage(text: text, isUser: true));
+
+      // UI ONLY: Add a temporary system message so the user knows it's thinking
       _currentSession.messages.add(
         ChatMessage(
-          text: '🔍 Searching for: "$text"',
+          text: '🔍 Searching the web...',
           isUser: false,
           isSystem: true,
         ),
       );
+
       _isLoading = true;
       _updateCurrentSessionData();
     });
@@ -391,7 +395,7 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
                     selected: isSelected,
                     selectedTileColor: Theme.of(
                       context,
-                    ).primaryColor.withOpacity(0.1),
+                    ).primaryColor.withValues(alpha: 0.1),
                     leading: const Icon(Icons.chat_bubble_outline),
                     title: Text(
                       session.title,
@@ -444,7 +448,7 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
             Container(
               width: double.infinity,
               color: isDark
-                  ? Colors.blue[900]?.withOpacity(0.3)
+                  ? Colors.blue[900]?.withValues(alpha: 0.3)
                   : Colors.blue[50],
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               child: Row(
@@ -774,7 +778,7 @@ class ChatBubble extends StatelessWidget {
     Color textColor = isDark ? Colors.white : Colors.black;
     if (message.isSystem) {
       bgColor = isDark
-          ? Colors.green[900]!.withOpacity(0.5)
+          ? Colors.green[900]!.withValues(alpha: 0.5)
           : Colors.green[50]!;
     } else if (message.isUser) {
       bgColor = isDark ? Colors.blue[800]! : Colors.blue[100]!;
@@ -823,11 +827,12 @@ class ChatBubble extends StatelessWidget {
                       final urlString = result['link'];
                       if (urlString != null && urlString.isNotEmpty) {
                         final url = Uri.parse(urlString);
-                        if (await canLaunchUrl(url))
+                        if (await canLaunchUrl(url)) {
                           await launchUrl(
                             url,
                             mode: LaunchMode.externalApplication,
                           );
+                        }
                       }
                     },
                     child: Padding(
