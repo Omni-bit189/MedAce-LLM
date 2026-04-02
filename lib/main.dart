@@ -4,8 +4,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'services/medace_api.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:flutter/foundation.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 
-// --- Theme Notifier ---
 final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.light);
 
 void main() {
@@ -35,11 +37,9 @@ class MyApp extends StatelessWidget {
           darkTheme: ThemeData(
             primarySwatch: Colors.blue,
             brightness: Brightness.dark,
-            scaffoldBackgroundColor: const Color(
-              0xFF131314,
-            ), // Matched to Gemini dark background
-            appBarTheme: AppBarTheme(
-              backgroundColor: const Color(0xFF131314),
+            scaffoldBackgroundColor: const Color(0xFF131314),
+            appBarTheme: const AppBarTheme(
+              backgroundColor: Color(0xFF131314),
               foregroundColor: Colors.white,
               elevation: 0,
             ),
@@ -54,7 +54,6 @@ class MyApp extends StatelessWidget {
 
 class OllamaChatPage extends StatefulWidget {
   const OllamaChatPage({super.key});
-
   @override
   _OllamaChatPageState createState() => _OllamaChatPageState();
 }
@@ -62,7 +61,6 @@ class OllamaChatPage extends StatefulWidget {
 class _OllamaChatPageState extends State<OllamaChatPage> {
   final _controller = TextEditingController();
 
-  // State variables
   bool _isLoading = false;
   bool _isUploading = false;
   String _selectedModel = 'llama3.2:latest';
@@ -72,10 +70,14 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
     'AntAngelMed/MedGemma1.5:4b',
   ];
 
-  // Chat History Management
   List<ChatSession> _allSessions = [];
   late ChatSession _currentSession;
   final String _storageKey = 'medace_chat_history';
+
+  // --- NEW: Pending Attachment States ---
+  PlatformFile? _pendingPdf;
+  XFile? _pendingImage;
+  Uint8List? _pendingImageBytes;
 
   @override
   void initState() {
@@ -84,51 +86,49 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
     _loadSavedSessions();
   }
 
-  // --- LOCAL STORAGE LOGIC ---
   Future<void> _loadSavedSessions() async {
     final prefs = await SharedPreferences.getInstance();
     final String? savedData = prefs.getString(_storageKey);
-
     if (savedData != null) {
-      final List<dynamic> decoded = jsonDecode(savedData);
-      setState(() {
-        _allSessions = decoded.map((e) => ChatSession.fromJson(e)).toList();
-      });
+      setState(
+        () => _allSessions = jsonDecode(
+          savedData,
+        ).map<ChatSession>((e) => ChatSession.fromJson(e)).toList(),
+      );
     }
   }
 
   Future<void> _saveSessionsToDisk() async {
     final prefs = await SharedPreferences.getInstance();
-    final String encoded = jsonEncode(
-      _allSessions.map((e) => e.toJson()).toList(),
+    await prefs.setString(
+      _storageKey,
+      jsonEncode(_allSessions.map((e) => e.toJson()).toList()),
     );
-    await prefs.setString(_storageKey, encoded);
   }
 
-  // --- SESSION MANAGEMENT LOGIC ---
   void _createNewSession() {
-    setState(() {
-      _currentSession = ChatSession(
+    setState(
+      () => _currentSession = ChatSession(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
         title: 'New Chat',
         messages: [],
-      );
-    });
+      ),
+    );
   }
 
   void _loadSession(String id) {
-    setState(() {
-      _currentSession = _allSessions.firstWhere((session) => session.id == id);
-    });
-    Navigator.pop(context); // Close the drawer
+    setState(
+      () => _currentSession = _allSessions.firstWhere(
+        (session) => session.id == id,
+      ),
+    );
+    Navigator.pop(context);
   }
 
   void _deleteSession(String id) {
     setState(() {
       _allSessions.removeWhere((session) => session.id == id);
-      if (_currentSession.id == id) {
-        _createNewSession();
-      }
+      if (_currentSession.id == id) _createNewSession();
       _saveSessionsToDisk();
     });
   }
@@ -136,81 +136,32 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
   void _updateCurrentSessionData() {
     if (!_allSessions.any((s) => s.id == _currentSession.id) &&
         _currentSession.messages.isNotEmpty) {
-      final firstMsg = _currentSession.messages
-          .firstWhere((m) => m.isUser)
-          .text;
-      _currentSession.title = firstMsg.length > 20
-          ? '${firstMsg.substring(0, 20)}...'
-          : firstMsg;
+      final userMessages = _currentSession.messages.where((m) => m.isUser);
+      if (userMessages.isNotEmpty) {
+        final firstMsg = userMessages.first.text;
+        _currentSession.title = firstMsg.length > 20
+            ? '${firstMsg.substring(0, 20)}...'
+            : firstMsg;
+      } else {
+        _currentSession.title = 'Document Scan';
+      }
       _allSessions.insert(0, _currentSession);
     }
     _saveSessionsToDisk();
   }
 
-  // --- CHAT LOGIC ---
   void _clearCurrentChat() {
     setState(() {
       _currentSession.messages.clear();
       _currentSession.messages.add(
         ChatMessage(
-          text: '🧹 Chat history cleared for this session. Starting fresh!',
+          text: '🧹 Chat history cleared for this session.',
           isUser: false,
           isSystem: true,
         ),
       );
       _updateCurrentSessionData();
     });
-  }
-
-  Future<void> _uploadDocument() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['pdf'],
-      withData: true,
-    );
-
-    if (result == null || result.files.isEmpty) return;
-
-    final file = result.files.first;
-    setState(() => _isUploading = true);
-
-    try {
-      Map<String, dynamic>? response;
-      if (file.bytes != null) {
-        response = await MedAceApiService.uploadDocumentBytes(
-          file.bytes!,
-          file.name,
-          sessionId: _currentSession.backendSessionId,
-        );
-      } else if (file.path != null) {
-        response = await MedAceApiService.uploadDocument(
-          file.path!,
-          file.name,
-          sessionId: _currentSession.backendSessionId,
-        );
-      }
-
-      if (response != null) {
-        final data = response;
-        setState(() {
-          _currentSession.backendSessionId = data['session_id'];
-          _currentSession.uploadedFiles = List<String>.from(
-            data['files_in_session'] ?? [file.name],
-          );
-          _currentSession.messages.add(
-            ChatMessage(
-              text:
-                  '📄 "${file.name}" uploaded successfully. You can now ask questions about it.',
-              isUser: false,
-              isSystem: true,
-            ),
-          );
-          _updateCurrentSessionData();
-        });
-      }
-    } finally {
-      setState(() => _isUploading = false);
-    }
   }
 
   Future<void> _clearDocuments() async {
@@ -221,7 +172,7 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
       _currentSession.uploadedFiles = [];
       _currentSession.messages.add(
         ChatMessage(
-          text: 'All uploaded documents have been removed from this session.',
+          text: 'All uploaded documents have been removed.',
           isUser: false,
           isSystem: true,
         ),
@@ -230,14 +181,155 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
     });
   }
 
-  Future<void> _sendMessage(String text) async {
-    if (text.trim().isEmpty) return;
+  // --- NEW: Staged File Pickers ---
+  Future<void> _stageDocument() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf'],
+      withData: true,
+    );
+    if (result != null && result.files.isNotEmpty) {
+      setState(() {
+        _pendingPdf = result.files.first;
+        _pendingImage = null; // Only allow one attachment at a time
+        _pendingImageBytes = null;
+      });
+    }
+  }
 
+  Future<void> _stageImage() async {
+    final ImagePicker picker = ImagePicker();
+    final XFile? image = await picker.pickImage(
+      source: ImageSource.camera,
+      maxWidth: 800,
+      imageQuality: 70,
+    );
+    if (image != null) {
+      final bytes = await image.readAsBytes();
+      setState(() {
+        _pendingImage = image;
+        _pendingImageBytes = bytes;
+        _pendingPdf = null;
+      });
+    }
+  }
+
+  void _clearPending() {
+    setState(() {
+      _pendingPdf = null;
+      _pendingImage = null;
+      _pendingImageBytes = null;
+    });
+  }
+
+  // --- NEW: Unified Send & Upload Logic ---
+  Future<void> _sendMessage(String text) async {
+    if (text.trim().isEmpty && _pendingPdf == null && _pendingImage == null) {
+      return;
+    }
+
+    _controller.clear();
+    setState(() => _isLoading = true);
+
+    String finalPrompt = text;
+    String? attachedName;
+    String? base64Str;
+
+    // 1. Process Pending PDF
+    if (_pendingPdf != null) {
+      final file = _pendingPdf!;
+      attachedName = file.name;
+      setState(() => _isUploading = true);
+      try {
+        Map<String, dynamic>? response;
+        if (file.bytes != null) {
+          response = await MedAceApiService.uploadDocumentBytes(
+            file.bytes!,
+            file.name,
+            sessionId: _currentSession.backendSessionId,
+          );
+        } else if (file.path != null) {
+          response = await MedAceApiService.uploadDocument(
+            file.path!,
+            file.name,
+            sessionId: _currentSession.backendSessionId,
+          );
+        }
+        if (response != null) {
+          _currentSession.backendSessionId = response['session_id'];
+          _currentSession.uploadedFiles = List<String>.from(
+            response['files_in_session'] ?? [file.name],
+          );
+        }
+      } finally {
+        setState(() => _isUploading = false);
+      }
+      if (finalPrompt.trim().isEmpty) {
+        finalPrompt = "Please summarize this uploaded document.";
+      }
+    }
+
+    // 2. Process Pending Image
+    if (_pendingImage != null && _pendingImageBytes != null) {
+      final image = _pendingImage!;
+      attachedName = image.name;
+      base64Str = base64Encode(_pendingImageBytes!);
+      setState(() => _isUploading = true);
+
+      try {
+        String extractedText = "";
+        if (kIsWeb) {
+          final response = await MedAceApiService.uploadImageBytes(
+            _pendingImageBytes!,
+            image.name,
+          );
+          extractedText =
+              (response != null && response['extracted_text'] != null)
+              ? response['extracted_text']
+              : "Error: Failed to extract text.";
+        } else {
+          final inputImage = InputImage.fromFilePath(image.path);
+          final textRecognizer = TextRecognizer(
+            script: TextRecognitionScript.latin,
+          );
+          final RecognizedText recognizedText = await textRecognizer
+              .processImage(inputImage);
+          extractedText = recognizedText.text.trim().isEmpty
+              ? "Error: No readable text found."
+              : recognizedText.text;
+          textRecognizer.close();
+        }
+
+        if (finalPrompt.trim().isEmpty) {
+          finalPrompt = "Please summarize this scanned document.";
+          finalPrompt = "$finalPrompt\n\n[Scanned Image Text]:\n$extractedText";
+        }
+      } catch (e) {
+        print("OCR Error: $e");
+      } finally {
+        setState(() => _isUploading = false);
+      }
+    }
+
+    // 3. Add to UI (The user's message now holds the attachments!)
+    setState(() {
+      _currentSession.messages.add(
+        ChatMessage(
+          text: text.trim().isEmpty ? "Sent an attachment." : text,
+          isUser: true,
+          attachedFileName: _pendingPdf != null ? attachedName : null,
+          base64Image: _pendingImage != null ? base64Str : null,
+        ),
+      );
+      _clearPending(); // Clear staged files
+      _updateCurrentSessionData();
+    });
+
+    // 4. Send to LLM
     List<Map<String, String>> history = [];
     int start = _currentSession.messages.length > 10
         ? _currentSession.messages.length - 10
         : 0;
-
     for (int i = start; i < _currentSession.messages.length; i++) {
       if (!_currentSession.messages[i].isSystem) {
         history.add({
@@ -247,15 +339,8 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
       }
     }
 
-    _controller.clear();
-    setState(() {
-      _currentSession.messages.add(ChatMessage(text: text, isUser: true));
-      _isLoading = true;
-      _updateCurrentSessionData();
-    });
-
     final responseData = await MedAceApiService.askQuestion(
-      text,
+      finalPrompt,
       _selectedModel,
       sessionId: _currentSession.backendSessionId,
       chatHistory: history,
@@ -263,22 +348,18 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
 
     setState(() {
       _isLoading = false;
-      if (responseData != null) {
-        _currentSession.messages.add(
-          ChatMessage(
-            text: responseData['answer'],
-            isUser: false,
-            sources: responseData['sources'],
-          ),
-        );
-      } else {
-        _currentSession.messages.add(
-          ChatMessage(
-            text: 'Error: Failed to connect to the MedAce Python API.',
-            isUser: false,
-          ),
-        );
-      }
+      _currentSession.messages.add(
+        responseData != null
+            ? ChatMessage(
+                text: responseData['answer'],
+                isUser: false,
+                sources: responseData['sources'],
+              )
+            : ChatMessage(
+                text: 'Error: Failed to connect to the MedAce API.',
+                isUser: false,
+              ),
+      );
       _updateCurrentSessionData();
     });
   }
@@ -288,10 +369,7 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
     _controller.clear();
 
     setState(() {
-      // FIX: Record the actual question as a standard User message so it enters the history
       _currentSession.messages.add(ChatMessage(text: text, isUser: true));
-
-      // UI ONLY: Add a temporary system message so the user knows it's thinking
       _currentSession.messages.add(
         ChatMessage(
           text: '🔍 Searching the web...',
@@ -299,7 +377,6 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
           isSystem: true,
         ),
       );
-
       _isLoading = true;
       _updateCurrentSessionData();
     });
@@ -390,9 +467,8 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
                 itemCount: _allSessions.length,
                 itemBuilder: (context, index) {
                   final session = _allSessions[index];
-                  final isSelected = session.id == _currentSession.id;
                   return ListTile(
-                    selected: isSelected,
+                    selected: session.id == _currentSession.id,
                     selectedTileColor: Theme.of(
                       context,
                     ).primaryColor.withValues(alpha: 0.1),
@@ -427,19 +503,17 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
                   ? Icons.dark_mode
                   : Icons.light_mode,
             ),
-            tooltip: 'Toggle Theme',
-            onPressed: () {
-              themeNotifier.value = themeNotifier.value == ThemeMode.light
-                  ? ThemeMode.dark
-                  : ThemeMode.light;
-            },
+            onPressed: () =>
+                themeNotifier.value = themeNotifier.value == ThemeMode.light
+                ? ThemeMode.dark
+                : ThemeMode.light,
           ),
           IconButton(
             icon: const Icon(Icons.delete_sweep),
-            tooltip: 'Clear Current Chat',
+            tooltip: 'Clear Chat',
             onPressed: _clearCurrentChat,
           ),
-          const SizedBox(width: 8), // Padding on the right
+          const SizedBox(width: 8),
         ],
       ),
       body: Column(
@@ -457,7 +531,7 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      'Docs: ${_currentSession.uploadedFiles.join(', ')}',
+                      'Active Docs: ${_currentSession.uploadedFiles.join(', ')}',
                       style: TextStyle(fontSize: 12, color: Colors.blue[700]),
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -470,18 +544,14 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
               ),
             ),
 
-          // --- CONDITIONAL RENDERING: Gemini UI vs Chat Log ---
           Expanded(
             child: _currentSession.messages.isEmpty
                 ? _buildEmptyState(isDark)
                 : ListView.builder(
                     padding: const EdgeInsets.all(8.0),
                     itemCount: _currentSession.messages.length,
-                    itemBuilder: (context, index) {
-                      return ChatBubble(
-                        message: _currentSession.messages[index],
-                      );
-                    },
+                    itemBuilder: (context, index) =>
+                        ChatBubble(message: _currentSession.messages[index]),
                   ),
           ),
 
@@ -498,22 +568,17 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
                   SizedBox(width: 8),
-                  Text('Uploading document...', style: TextStyle(fontSize: 12)),
+                  Text('Processing...', style: TextStyle(fontSize: 12)),
                 ],
               ),
             ),
 
-          // --- THE NEW GEMINI PILL INPUT ---
           _buildInputArea(isDark),
           const SizedBox(height: 16),
         ],
       ),
     );
   }
-
-  // =========================================================================
-  // NEW UI HELPERS
-  // =========================================================================
 
   Widget _buildEmptyState(bool isDark) {
     return Center(
@@ -522,13 +587,12 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
           padding: const EdgeInsets.symmetric(horizontal: 24.0),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment:
-                CrossAxisAlignment.start, // Left aligned like Gemini
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                '✨ Hi I am MedAce, Your Medicallm Assistant',
+                '✨ Hi Omair',
                 style: TextStyle(
-                  fontSize: 27,
+                  fontSize: 32,
                   fontWeight: FontWeight.w500,
                   color: isDark ? Colors.grey[400] : Colors.grey[600],
                 ),
@@ -545,14 +609,13 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
               ),
               const SizedBox(height: 50),
 
-              // Suggestion Chips (Replicating the Gemini layout)
               Wrap(
                 spacing: 12,
                 runSpacing: 12,
                 children: [
                   ActionChip(
                     avatar: const Icon(Icons.description, size: 18),
-                    label: const Text('Analyze Medical PDF'),
+                    label: const Text('Upload Medical PDF'),
                     backgroundColor: isDark
                         ? const Color(0xFF1E1F20)
                         : Colors.grey[100],
@@ -561,11 +624,11 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(20),
                     ),
-                    onPressed: _uploadDocument,
+                    onPressed: _stageDocument,
                   ),
                   ActionChip(
-                    avatar: const Icon(Icons.travel_explore, size: 18),
-                    label: const Text('Search PubMed'),
+                    avatar: const Icon(Icons.document_scanner, size: 18),
+                    label: const Text('Scan Document'),
                     backgroundColor: isDark
                         ? const Color(0xFF1E1F20)
                         : Colors.grey[100],
@@ -574,7 +637,7 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(20),
                     ),
-                    onPressed: () => _searchWeb("Latest medical research"),
+                    onPressed: _stageImage,
                   ),
                 ],
               ),
@@ -589,97 +652,200 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16.0),
       child: Container(
-        constraints: const BoxConstraints(maxWidth: 800), // Max width for web
-        padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
+        constraints: const BoxConstraints(maxWidth: 800),
+        padding: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 4.0),
         decoration: BoxDecoration(
-          color: isDark
-              ? const Color(0xFF1E1F20)
-              : Colors.grey[100], // Gemini's specific pill color
+          color: isDark ? const Color(0xFF1E1F20) : Colors.grey[200],
           borderRadius: BorderRadius.circular(30),
         ),
-        child: Row(
+        child: Column(
           children: [
-            // + Button for Upload
-            IconButton(
-              icon: const Icon(Icons.add_circle_outline),
-              tooltip: 'Upload PDF',
-              color: isDark ? Colors.grey[400] : Colors.grey[600],
-              onPressed: _isUploading ? null : _uploadDocument,
-            ),
-            // Search Button
-            IconButton(
-              icon: const Icon(Icons.travel_explore),
-              tooltip: 'Search Web',
-              color: isDark ? Colors.grey[400] : Colors.grey[600],
-              onPressed: _isUploading
-                  ? null
-                  : () => _searchWeb(_controller.text),
-            ),
-
-            // Text Input
-            Expanded(
-              child: TextField(
-                controller: _controller,
-                onSubmitted: _sendMessage,
-                style: TextStyle(color: isDark ? Colors.white : Colors.black),
-                decoration: InputDecoration(
-                  hintText: 'Ask MedAce...',
-                  hintStyle: TextStyle(
-                    color: isDark ? Colors.grey[500] : Colors.grey[600],
+            // --- NEW: Pending Attachment Preview Area ---
+            if (_pendingPdf != null || _pendingImage != null)
+              Container(
+                margin: const EdgeInsets.only(left: 16, top: 12, bottom: 8),
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: isDark ? const Color(0xFF2E2F30) : Colors.white,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: isDark ? Colors.grey[700]! : Colors.grey[300]!,
                   ),
-                  border: InputBorder.none,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (_pendingImageBytes != null)
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(6),
+                        child: Image.memory(
+                          _pendingImageBytes!,
+                          height: 40,
+                          width: 40,
+                          fit: BoxFit.cover,
+                        ),
+                      ),
+                    if (_pendingPdf != null)
+                      Icon(
+                        Icons.picture_as_pdf,
+                        color: Colors.red[400],
+                        size: 30,
+                      ),
+                    const SizedBox(width: 12),
+                    Flexible(
+                      child: Text(
+                        _pendingPdf?.name ??
+                            _pendingImage?.name ??
+                            "Attached File",
+                        style: TextStyle(
+                          color: isDark ? Colors.white : Colors.black,
+                          fontSize: 13,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, size: 18),
+                      color: Colors.grey[500],
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      onPressed: _clearPending,
+                    ),
+                  ],
                 ),
               ),
-            ),
 
-            // Embedded LLM Selector
-            Container(
-              height: 36,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              decoration: BoxDecoration(
-                color: isDark ? const Color(0xFF2E2F30) : Colors.white,
-                borderRadius: BorderRadius.circular(18),
-              ),
-              child: DropdownButtonHideUnderline(
-                child: DropdownButton<String>(
-                  value: _selectedModel,
+            // Standard Input Row
+            Row(
+              children: [
+                PopupMenuButton<String>(
                   icon: Icon(
-                    Icons.keyboard_arrow_down,
-                    size: 16,
-                    color: isDark ? Colors.white70 : Colors.black54,
+                    Icons.add_circle_outline,
+                    color: isDark ? Colors.grey[400] : Colors.grey[600],
                   ),
-                  dropdownColor: isDark
-                      ? const Color(0xFF2E2F30)
-                      : Colors.white,
-                  style: TextStyle(
-                    color: isDark ? Colors.white : Colors.black87,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w500,
+                  tooltip: 'Attach File or Photo',
+                  offset: const Offset(0, -120),
+                  color: isDark ? const Color(0xFF2E2F30) : Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
                   ),
-                  onChanged: (String? newValue) =>
-                      setState(() => _selectedModel = newValue!),
-                  items: _availableModels.map<DropdownMenuItem<String>>((
-                    String model,
-                  ) {
-                    // Clean up the name so it fits nicely inside the pill
-                    String displayName = model
-                        .split(':')[0]
-                        .replaceAll('AntAngelMed/', '');
-                    return DropdownMenuItem<String>(
-                      value: model,
-                      child: Text(displayName),
-                    );
-                  }).toList(),
+                  onSelected: (value) {
+                    if (value == 'pdf') _stageDocument();
+                    if (value == 'camera') _stageImage();
+                  },
+                  itemBuilder: (BuildContext context) =>
+                      <PopupMenuEntry<String>>[
+                        PopupMenuItem<String>(
+                          value: 'pdf',
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.picture_as_pdf,
+                                color: isDark ? Colors.red[300] : Colors.red,
+                              ),
+                              const SizedBox(width: 12),
+                              Text(
+                                'Upload PDF',
+                                style: TextStyle(
+                                  color: isDark ? Colors.white : Colors.black87,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'camera',
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.camera_alt,
+                                color: isDark ? Colors.blue[300] : Colors.blue,
+                              ),
+                              const SizedBox(width: 12),
+                              Text(
+                                'Take Photo',
+                                style: TextStyle(
+                                  color: isDark ? Colors.white : Colors.black87,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
                 ),
-              ),
-            ),
 
-            // Send Button
-            IconButton(
-              icon: const Icon(Icons.send),
-              color: isDark ? Colors.grey[300] : Colors.black87,
-              onPressed: () => _sendMessage(_controller.text),
+                IconButton(
+                  icon: const Icon(Icons.travel_explore),
+                  color: isDark ? Colors.grey[400] : Colors.grey[600],
+                  onPressed: _isUploading
+                      ? null
+                      : () => _searchWeb(_controller.text),
+                ),
+
+                Expanded(
+                  child: TextField(
+                    controller: _controller,
+                    onSubmitted: _sendMessage,
+                    style: TextStyle(
+                      color: isDark ? Colors.white : Colors.black,
+                    ),
+                    decoration: InputDecoration(
+                      hintText: 'Ask MedAce...',
+                      hintStyle: TextStyle(
+                        color: isDark ? Colors.grey[500] : Colors.grey[600],
+                      ),
+                      border: InputBorder.none,
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
+                  ),
+                ),
+
+                Container(
+                  height: 36,
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  decoration: BoxDecoration(
+                    color: isDark ? const Color(0xFF2E2F30) : Colors.white,
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String>(
+                      value: _selectedModel,
+                      icon: Icon(
+                        Icons.keyboard_arrow_down,
+                        size: 16,
+                        color: isDark ? Colors.white70 : Colors.black54,
+                      ),
+                      dropdownColor: isDark
+                          ? const Color(0xFF2E2F30)
+                          : Colors.white,
+                      style: TextStyle(
+                        color: isDark ? Colors.white : Colors.black87,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                      ),
+                      onChanged: (String? newValue) =>
+                          setState(() => _selectedModel = newValue!),
+                      items: _availableModels
+                          .map<DropdownMenuItem<String>>(
+                            (String model) => DropdownMenuItem<String>(
+                              value: model,
+                              child: Text(
+                                model
+                                    .split(':')[0]
+                                    .replaceAll('AntAngelMed/', ''),
+                              ),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.send),
+                  color: isDark ? Colors.grey[300] : Colors.black87,
+                  onPressed: () => _sendMessage(_controller.text),
+                ),
+              ],
             ),
           ],
         ),
@@ -687,10 +853,6 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
     );
   }
 }
-
-// =========================================================================
-// DATA MODELS & WIDGETS
-// =========================================================================
 
 class ChatSession {
   final String id;
@@ -714,7 +876,6 @@ class ChatSession {
     'uploadedFiles': uploadedFiles,
     'messages': messages.map((m) => m.toJson()).toList(),
   };
-
   factory ChatSession.fromJson(Map<String, dynamic> json) => ChatSession(
     id: json['id'],
     title: json['title'],
@@ -733,6 +894,8 @@ class ChatMessage {
   final List<dynamic>? sources;
   final List<dynamic>? searchResults;
   final List<dynamic>? imageResults;
+  final String? attachedFileName;
+  final String? base64Image;
 
   ChatMessage({
     required this.text,
@@ -741,6 +904,8 @@ class ChatMessage {
     this.sources,
     this.searchResults,
     this.imageResults,
+    this.attachedFileName,
+    this.base64Image,
   });
 
   Map<String, dynamic> toJson() => {
@@ -750,8 +915,9 @@ class ChatMessage {
     'sources': sources,
     'searchResults': searchResults,
     'imageResults': imageResults,
+    'attachedFileName': attachedFileName,
+    'base64Image': base64Image,
   };
-
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
     text: json['text'] ?? '',
     isUser: json['isUser'] ?? false,
@@ -759,6 +925,8 @@ class ChatMessage {
     sources: json['sources'] as List<dynamic>?,
     searchResults: json['searchResults'] as List<dynamic>?,
     imageResults: json['imageResults'] as List<dynamic>?,
+    attachedFileName: json['attachedFileName'],
+    base64Image: json['base64Image'],
   );
 }
 
@@ -799,6 +967,61 @@ class ChatBubble extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // --- FIX 1: Smaller Image Thumbnails! ---
+              if (message.base64Image != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12.0),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: Image.memory(
+                      base64Decode(message.base64Image!),
+                      height: 150,
+                      width: 150,
+                      fit: BoxFit.cover, // No more double.infinity!
+                    ),
+                  ),
+                ),
+
+              if (message.attachedFileName != null &&
+                  message.base64Image == null)
+                Container(
+                  margin: const EdgeInsets.only(bottom: 12.0),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: isDark
+                        ? Colors.blue[900]?.withValues(alpha: 0.3)
+                        : Colors
+                              .blue[50], // Changed from Red to Blue for user bubbles
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: isDark ? Colors.blue[800]! : Colors.blue[200]!,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.picture_as_pdf,
+                        color: isDark ? Colors.blue[300] : Colors.blue,
+                      ),
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: Text(
+                          message.attachedFileName!,
+                          style: TextStyle(
+                            color: textColor,
+                            fontWeight: FontWeight.bold,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
               Text(
                 message.text.trim(),
                 style: TextStyle(
@@ -808,6 +1031,7 @@ class ChatBubble extends StatelessWidget {
                       : FontStyle.normal,
                 ),
               ),
+
               if (!message.isUser &&
                   !message.isSystem &&
                   message.searchResults != null &&

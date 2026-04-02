@@ -3,6 +3,10 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
+	<key>NSCameraUsageDescription</key>
+    <string>MedAce needs camera access to scan medical documents.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>MedAce needs photo access to upload saved document images.</string>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
 	<string>MedAce AI</string>
