@@ -1,4 +1,5 @@
 import os
+import shutil
 from typing import Optional
 import uuid
 import tempfile
@@ -11,9 +12,16 @@ from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from ddgs import DDGS
+from PIL import Image
+import pytesseract
+import io
+
+# Tell Python exactly where you installed Tesseract
+# Download from: https://github.com/UB-Mannheim/tesseract/wiki
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 
 app = FastAPI(title="MedAce API")
@@ -41,8 +49,32 @@ permanent_retriever = permanent_vectorstore.as_retriever(
     search_kwargs={"k": 5, "score_threshold": 0.6}
 )
 
-# Session stores for uploaded documents (in-memory only, cleared on restart)
+# Session stores for uploaded documents (persisted to disk so they survive restarts)
+SESSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_stores")
+os.makedirs(SESSION_DIR, exist_ok=True)
 session_stores: dict[str, dict] = {}
+
+def _load_session_from_disk(session_id: str) -> bool:
+    """Try to reload a session vectorstore from its persisted directory."""
+    session_path = os.path.join(SESSION_DIR, session_id)
+    if os.path.isdir(session_path):
+        session_stores[session_id] = {
+            "vectorstore": Chroma(
+                persist_directory=session_path,
+                embedding_function=embeddings,
+                collection_name=f"session_{session_id.replace('-', '_')}"
+            ),
+            "files": []
+        }
+        print(f"Reloaded session '{session_id}' from disk.")
+        return True
+    return False
+
+# Auto-reload any sessions persisted before the last restart
+for _sid in os.listdir(SESSION_DIR):
+    if os.path.isdir(os.path.join(SESSION_DIR, _sid)):
+        _load_session_from_disk(_sid)
+
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
@@ -75,16 +107,20 @@ def format_docs(docs):
 def get_combined_docs(question: str, session_id: Optional[str] = None) -> list:
     """Retrieve from permanent DB, and also from session DB if one exists."""
     permanent_docs = permanent_retriever.invoke(question)
-
     session_docs = []
-    if session_id and session_id in session_stores:
-        session_retriever = session_stores[session_id]["vectorstore"].as_retriever(
-            search_kwargs={"k": 5}
-        )
-        session_docs = session_retriever.invoke(question)
-        print(f"Session '{session_id}': retrieved {len(session_docs)} chunks from uploaded docs")
-    elif session_id:
-        print(f"Warning: session_id '{session_id}' not found in session_stores (server may have restarted)")
+    if session_id:
+        # Try to reload from disk if not already in memory
+        if session_id not in session_stores:
+            _load_session_from_disk(session_id)
+
+        if session_id in session_stores:
+            session_retriever = session_stores[session_id]["vectorstore"].as_retriever(
+                search_kwargs={"k": 5}
+            )
+            session_docs = session_retriever.invoke(question)
+            print(f"Session '{session_id}': retrieved {len(session_docs)} chunks from uploaded docs")
+        else:
+            print(f"Warning: session_id '{session_id}' not found on disk or in memory.")
 
     return permanent_docs + session_docs
 
@@ -104,20 +140,29 @@ async def upload_document(
     file: UploadFile = File(...),
     session_id: str = Form(None)
 ):
-    if not file.filename or not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    # Validate file extension
+    valid_extensions = [".pdf", ".docx", ".txt"]
+    ext = os.path.splitext(file.filename)[1].lower() if file.filename else ""
+    if ext not in valid_extensions:
+        raise HTTPException(status_code=400, detail=f"Only {', '.join(valid_extensions)} files are supported.")
 
     if not session_id:
         session_id = str(uuid.uuid4())
 
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             contents = await file.read()
             tmp.write(contents)
             tmp_path = tmp.name
-
-        loader = PyPDFLoader(tmp_path)
+        # Checks file extension for correct Langchain Loader to be used
+        if ext == ".pdf":
+            loader = PyPDFLoader(tmp_path)
+        elif ext == ".docx":
+            loader = Docx2txtLoader(tmp_path)
+        elif ext == ".txt":
+            loader = TextLoader(tmp_path)
+        
         docs = loader.load()
         splits = text_splitter.split_documents(docs)
 
@@ -125,8 +170,11 @@ async def upload_document(
             doc.metadata["source"] = file.filename
 
         if session_id not in session_stores:
+            session_path = os.path.join(SESSION_DIR, session_id)
+            os.makedirs(session_path, exist_ok=True)
             session_stores[session_id] = {
                 "vectorstore": Chroma(
+                    persist_directory=session_path,
                     embedding_function=embeddings,
                     collection_name=f"session_{session_id.replace('-', '_')}"
                 ),
@@ -159,9 +207,12 @@ async def upload_document(
 async def clear_session(request: SessionRequest):
     if request.session_id in session_stores:
         del session_stores[request.session_id]
-        print(f"Session {request.session_id} cleared.")
+    # Also remove from disk
+    session_path = os.path.join(SESSION_DIR, request.session_id)
+    if os.path.isdir(session_path):
+        shutil.rmtree(session_path, ignore_errors=True)
+        print(f"Session {request.session_id} cleared (memory + disk).")
         return {"message": "Session cleared successfully."}
-    return {"message": "Session not found — nothing to clear."}
 
 
 # --- 5. Search Endpoint (Powered by Local SearXNG) ---
@@ -269,8 +320,26 @@ async def search_web(request: QueryRequest):
     except Exception as e:
         print(f"Error during SearXNG search: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+        
+# --- 6. OCR Endpoint ---
+@app.post("/upload-image")
+async def upload_image(file: UploadFile = File(...)):
+    try:
+        # Read the image bytes
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents))
+        
+        # Run OCR to extract text
+        extracted_text = pytesseract.image_to_string(image)
+        
+        if not extracted_text.strip():
+            return {"extracted_text": "Error: No readable text found in the image.", "filename": file.filename}
+            
+        return {"extracted_text": extracted_text, "filename": file.filename}
+    except Exception as e:
+        return {"extracted_text": f"OCR Error: {str(e)}", "filename": file.filename}
 
-# --- 6. Ask Endpoint ---
+# --- 7. Ask Endpoint ---
 @app.post("/ask")
 async def ask_medace(request: QueryRequest):
     try:

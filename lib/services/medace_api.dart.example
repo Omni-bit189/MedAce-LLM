@@ -25,7 +25,7 @@ class MedAceApiService {
   static String get askUrl => '$baseUrl/ask';
   static String get uploadUrl => '$baseUrl/upload';
   static String get clearSessionUrl => '$baseUrl/clear-session';
-  static String get searchUrl => '$baseUrl/search'; 
+  static String get searchUrl => '$baseUrl/search';
 
   // --- Ask a question (with optional session ID for uploaded docs) ---
   static Future<Map<String, dynamic>?> askQuestion(
@@ -68,17 +68,19 @@ class MedAceApiService {
     }
   }
 
-  static Future<Map<String, dynamic>?> searchWeb(String query, String selectedModel) async {
+  static Future<Map<String, dynamic>?> searchWeb(
+    String query,
+    String selectedModel,
+  ) async {
     final client = http.Client();
     try {
-      final response = await client.post(
-        Uri.parse(searchUrl),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'question': query,
-          'model': selectedModel,
-        }),
-      ).timeout(const Duration(minutes: 5));
+      final response = await client
+          .post(
+            Uri.parse(searchUrl),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'question': query, 'model': selectedModel}),
+          )
+          .timeout(const Duration(minutes: 5));
 
       if (response.statusCode == 200) {
         return jsonDecode(response.body);
@@ -94,7 +96,7 @@ class MedAceApiService {
     }
   }
 
-  // --- Upload a PDF and get/update a session ID ---
+  // --- Upload a document and get/update a session ID ---
   static Future<Map<String, dynamic>?> uploadDocument(
     String filePath,
     String fileName, {
@@ -142,7 +144,7 @@ class MedAceApiService {
     }
   }
 
-  // --- Upload PDF from bytes (for web/mobile file picker) ---
+  // --- Upload document from bytes (for web/mobile file picker) ---
   static Future<Map<String, dynamic>?> uploadDocumentBytes(
     List<int> bytes,
     String fileName, {
@@ -181,6 +183,34 @@ class MedAceApiService {
       return null;
     } finally {
       client.close();
+    }
+  }
+
+  // --- Image Upload for Web Fallback OCR ---
+  static Future<Map<String, dynamic>?> uploadImageBytes(
+    List<int> bytes,
+    String filename,
+  ) async {
+    try {
+      var uri = Uri.parse('$baseUrl/upload-image');
+      var request = http.MultipartRequest('POST', uri);
+
+      request.files.add(
+        http.MultipartFile.fromBytes('file', bytes, filename: filename),
+      );
+
+      var streamedResponse = await request.send();
+      var response = await http.Response.fromStream(streamedResponse);
+
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      } else {
+        print('Image upload failed with status: ${response.statusCode}');
+        return null;
+      }
+    } catch (e) {
+      print('Error uploading image: $e');
+      return null;
     }
   }
 
