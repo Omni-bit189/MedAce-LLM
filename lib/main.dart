@@ -126,6 +126,17 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
   }
 
   void _deleteSession(String id) {
+    // Find the session before removing it
+    final session = _allSessions.firstWhere(
+      (s) => s.id == id,
+      orElse: () => _currentSession,
+    );
+
+    // Clear backend session if it exists
+    if (session.backendSessionId != null) {
+      MedAceApiService.clearSession(session.backendSessionId!);
+    }
+
     setState(() {
       _allSessions.removeWhere((session) => session.id == id);
       if (_currentSession.id == id) _createNewSession();
@@ -151,6 +162,13 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
   }
 
   void _clearCurrentChat() {
+    // Clear backend docs if any
+    if (_currentSession.backendSessionId != null) {
+      MedAceApiService.clearSession(_currentSession.backendSessionId!);
+      _currentSession.backendSessionId = null;
+      _currentSession.uploadedFiles = [];
+    }
+
     setState(() {
       _currentSession.messages.clear();
       _currentSession.messages.add(
@@ -185,7 +203,8 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
   Future<void> _stageDocument() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['pdf'],
+      // Add 'docx' and 'txt' to the list of allowed extensions
+      allowedExtensions: ['pdf', 'docx', 'txt'],
       withData: true,
     );
     if (result != null && result.files.isNotEmpty) {
@@ -302,8 +321,8 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
 
         if (finalPrompt.trim().isEmpty) {
           finalPrompt = "Please summarize this scanned document.";
-          finalPrompt = "$finalPrompt\n\n[Scanned Image Text]:\n$extractedText";
         }
+        finalPrompt = "$finalPrompt\n\n[Scanned Image Text]:\n$extractedText";
       } catch (e) {
         print("OCR Error: $e");
       } finally {
@@ -615,7 +634,7 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
                 children: [
                   ActionChip(
                     avatar: const Icon(Icons.description, size: 18),
-                    label: const Text('Upload Medical PDF'),
+                    label: const Text('Upload Medical Document'),
                     backgroundColor: isDark
                         ? const Color(0xFF1E1F20)
                         : Colors.grey[100],
@@ -687,8 +706,8 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
                       ),
                     if (_pendingPdf != null)
                       Icon(
-                        Icons.picture_as_pdf,
-                        color: Colors.red[400],
+                        Icons.insert_drive_file,
+                        color: Colors.blue[400],
                         size: 30,
                       ),
                     const SizedBox(width: 12),
@@ -740,12 +759,12 @@ class _OllamaChatPageState extends State<OllamaChatPage> {
                           child: Row(
                             children: [
                               Icon(
-                                Icons.picture_as_pdf,
-                                color: isDark ? Colors.red[300] : Colors.red,
+                                Icons.insert_drive_file,
+                                color: isDark ? Colors.blue[300] : Colors.blue,
                               ),
                               const SizedBox(width: 12),
                               Text(
-                                'Upload PDF',
+                                'Upload Document',
                                 style: TextStyle(
                                   color: isDark ? Colors.white : Colors.black87,
                                 ),
@@ -1004,7 +1023,7 @@ class ChatBubble extends StatelessWidget {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Icon(
-                        Icons.picture_as_pdf,
+                        Icons.insert_drive_file,
                         color: isDark ? Colors.blue[300] : Colors.blue,
                       ),
                       const SizedBox(width: 8),
